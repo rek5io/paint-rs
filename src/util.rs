@@ -22,13 +22,11 @@ pub enum Key {
     Z,
 
     LShift,
-
-    Unknown(u32),
 }
 
 impl Key {
-    pub fn from_code(code: u32) -> Self {
-        match code {
+    pub fn from_code(code: u32) -> Option<Self> {
+        Some(match code {
             1 => Self::Esc,
             103 => Self::Up,
             108 => Self::Down,
@@ -52,7 +50,7 @@ impl Key {
 
             42 => Self::LShift,
 
-            _ => Self::Unknown(code),
-        }
+            _ => return None,
+        })
     }
 }

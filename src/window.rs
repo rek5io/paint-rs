@@ -1,5 +1,6 @@
-use std::os::unix::io::AsFd;
+use std::{fs::File, os::unix::io::AsFd};
 
+use memmap2::RemapOptions;
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum,
     protocol::{
@@ -21,9 +22,10 @@ pub struct WindowState {
     shm: Option<wl_shm::WlShm>,
     pool: Option<wl_shm_pool::WlShmPool>,
     ev: Option<EventQueue<WindowState>>,
-    pub mmap: Option<memmap2::MmapMut>,
+    mmap: Option<memmap2::MmapMut>,
+    file: Option<File>,
     configured: bool,
-    pub keys_pressed: smallvec::SmallVec<[Key; 64]>,
+    pub keys_pressed: Vec<Key>,
     pub pressed_left: bool,
     pub clicked_left: bool,
     pub size: (u32, u32),
@@ -49,8 +51,9 @@ impl WindowState {
             pool: None,
             ev: Some(ev),
             mmap: None,
+            file: None,
             configured: false,
-            keys_pressed: smallvec::SmallVec::new(),
+            keys_pressed: Vec::with_capacity(64),
             pressed_left: false,
             clicked_left: false,
             size: (width, height),
@@ -96,44 +99,52 @@ impl WindowState {
         let copy_w = width.min(win_w);
         let copy_h = height.min(win_h);
 
-        let Some(buf) = self.mmap.as_mut() else {
-            return;
-        };
+        if let Some(buf) = self.mmap.as_mut() {
+            for y in 0..copy_h {
+                let src_row = (y * width) as usize;
+                let dst_row = (y * win_w) as usize * 4;
 
-        for y in 0..copy_h {
-            let src_row = (y * width) as usize;
-            let dst_row = (y * win_w) as usize * 4;
-
-            for x in 0..copy_w {
-                let pixel = &frame[src_row + x as usize];
-                let off = dst_row + x as usize * 4;
-
-                buf[off + 0] = pixel.b;
-                buf[off + 1] = pixel.g;
-                buf[off + 2] = pixel.r;
-                buf[off + 3] = 0xff;
+                for x in 0..copy_w {
+                    let pixel = &frame[src_row + x as usize];
+                    let off = dst_row + x as usize * 4;
+                    buf[off + 0] = pixel.b;
+                    buf[off + 1] = pixel.g;
+                    buf[off + 2] = pixel.r;
+                    buf[off + 3] = 0xff;
+                }
             }
-        }
 
-        self.show_surface();
+            self.show_surface();
+        }
     }
 
     fn recreate_buffer(&mut self, qh: &QueueHandle<WindowState>) {
         let shm = self.shm.as_ref().unwrap();
-
         let w = self.size.0;
         let h = self.size.1;
         let size = w * h * 4;
 
-        let file = memfd::MemfdOptions::default()
-            .create("memfd_wl_window")
-            .unwrap()
-            .into_file();
+        if self.file.is_none() {
+            self.file = Some(
+                memfd::MemfdOptions::default()
+                    .create("memfd_wl_window")
+                    .unwrap()
+                    .into_file(),
+            );
+        }
 
+        let file = self.file.as_mut().unwrap();
         file.set_len(size as u64).unwrap();
 
-        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
-        self.mmap = Some(mmap.make_mut().unwrap());
+        if let Some(mmap) = self.mmap.as_mut() {
+            unsafe {
+                mmap.remap(size as usize, RemapOptions::new().may_move(true))
+                    .unwrap();
+            }
+        } else {
+            let mmap = unsafe { memmap2::Mmap::map(file as &File).unwrap() };
+            self.mmap = Some(mmap.make_mut().unwrap());
+        }
 
         let pool = shm.create_pool(file.as_fd(), size as i32, qh, ());
 
@@ -147,12 +158,17 @@ impl WindowState {
             (),
         );
 
+        if let Some(buffer) = self.buffer.take() {
+            buffer.destroy();
+        }
+
+        if let Some(pool) = self.pool.take() {
+            pool.destroy();
+        }
+
         self.pool = Some(pool);
         self.buffer = Some(buffer);
-
-        if self.configured {
-            self.show_surface();
-        }
+        self.show_surface();
     }
 }
 
@@ -238,7 +254,6 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for WindowState {
                     state.size.0 = w;
                     state.size.1 = h;
                     state.recreate_buffer(qh);
-                    return;
                 }
             }
         }
@@ -363,17 +378,16 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WindowState {
         _qhandle: &QueueHandle<Self>,
     ) {
         if let wl_keyboard::Event::Key { key, state, .. } = event {
-            let key = Key::from_code(key);
-
-            match state {
-                WEnum::Value(wl_keyboard::KeyState::Pressed) => {
-                    if !window_state.keys_pressed.contains(&key) {
-                        window_state.keys_pressed.push(key);
+            match (state, Key::from_code(key)) {
+                (WEnum::Value(wl_keyboard::KeyState::Pressed), Some(k)) => {
+                    if !window_state.keys_pressed.contains(&k) {
+                        window_state.keys_pressed.push(k);
                     }
                 }
-                WEnum::Value(wl_keyboard::KeyState::Released) => {
-                    window_state.keys_pressed.retain(|e| *e != key);
+                (WEnum::Value(wl_keyboard::KeyState::Released), Some(k)) => {
+                    window_state.keys_pressed.retain(|e| *e != k);
                 }
+                (_, None) => println!("unknown key: {}", key),
                 _ => {}
             }
         }
@@ -408,8 +422,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WindowState {
                 surface_y,
                 ..
             } => {
-                s.mouse.0 = surface_x.clamp(0.0, u32::MAX as f64) as u32;
-                s.mouse.1 = surface_y.clamp(0.0, u32::MAX as f64) as u32;
+                s.mouse = (
+                    surface_x.clamp(0.0, u32::MAX as f64) as u32,
+                    surface_y.clamp(0.0, u32::MAX as f64) as u32,
+                );
             }
 
             _ => {}

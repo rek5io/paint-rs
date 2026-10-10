@@ -33,7 +33,7 @@ pub struct Paint {
     pub buffer_size: (u32, u32),
     pub screen_buffer: Vec<Pixel>,
     pub main_buffer: Vec<Pixel>,
-    pub screens_buffer: VecDeque<(u32, u32, Vec<Pixel>)>,
+    pub screens_buffer: VecDeque<((u32, u32), Vec<Pixel>)>,
     pub window: WindowState,
     pub brush_size: u32,
     pub brush_mode: BrushMode,
@@ -82,12 +82,44 @@ impl Paint {
             }
 
             if self.window.clicked_left {
-                self.save_step();
+                if self.screens_buffer.len() >= 192 {
+                    let _ = self.screens_buffer.pop_front();
+                }
+
+                self.screens_buffer
+                    .push_back((self.window.size, self.main_buffer.clone()));
+
+                println!("saved step: {}", self.screens_buffer.len());
             }
 
-            self.render_ui();
+            (|| {
+                let (new_w, new_h) = self.window.size;
+                let (old_w, old_h) = self.buffer_size;
+                if new_w <= old_w && new_h <= old_h {
+                    return;
+                }
 
-            self.resize_up();
+                println!("resize up");
+
+                let target_w = old_w.max(new_w);
+                let target_h = old_h.max(new_h);
+
+                let mut new_buf = vec![self.background; (target_w * target_h) as usize];
+
+                for y in 0..old_h {
+                    let old_row = (y * old_w) as usize;
+                    let new_row = (y * target_w) as usize;
+
+                    new_buf[new_row..new_row + old_w as usize]
+                        .copy_from_slice(&self.main_buffer[old_row..old_row + old_w as usize]);
+                }
+
+                self.main_buffer = new_buf;
+                self.screen_buffer = self.main_buffer.clone();
+                self.buffer_size = (target_w, target_h);
+            })();
+
+            self.render_ui();
 
             self.window
                 .put_frame(&self.screen_buffer, self.buffer_size.0, self.buffer_size.1);
@@ -107,7 +139,11 @@ impl Paint {
                 Key::Esc => self.window.want_close = true,
 
                 Key::Up => self.brush_size += 1,
-                Key::Down if self.brush_size > 1 => self.brush_size -= 1,
+                Key::Down => {
+                    if self.brush_size > 1 {
+                        self.brush_size -= 1;
+                    }
+                }
 
                 Key::W => {
                     self.color = Pixel {
@@ -168,7 +204,7 @@ impl Paint {
 
                 Key::Z => self.restore_step(),
 
-                u => println!("pressed unknown: {:?}", u),
+                Key::LShift => {}
             }
 
             match key {
@@ -181,68 +217,25 @@ impl Paint {
         }
     }
 
-    fn save_step(&mut self) {
-        if self.screens_buffer.len() == 192 {
-            let _ = self.screens_buffer.pop_front();
-        }
-
-        self.screens_buffer.push_back((
-            self.window.size.0,
-            self.window.size.1,
-            self.main_buffer.clone(),
-        ));
-
-        println!("saved step: {}", self.screens_buffer.len());
-    }
-
     fn restore_step(&mut self) {
-        if let Some((w, h, buffer)) = self.screens_buffer.pop_back() {
+        if let Some((s, buffer)) = self.screens_buffer.pop_back() {
             println!("restored step: {}", self.screens_buffer.len());
 
-            self.main_buffer = buffer;
-            self.screen_buffer = self.main_buffer.clone();
-            self.buffer_size = (w, h);
+            self.main_buffer = buffer.clone();
+            self.screen_buffer = buffer;
+            self.buffer_size = s;
         }
-    }
-
-    fn resize_up(&mut self) {
-        let (new_w, new_h) = self.window.size;
-        let (old_w, old_h) = self.buffer_size;
-
-        if new_w <= old_w && new_h <= old_h {
-            return;
-        }
-
-        println!("resize up");
-
-        let target_w = old_w.max(new_w);
-        let target_h = old_h.max(new_h);
-
-        let mut new_buf = vec![self.background; (target_w * target_h) as usize];
-
-        for y in 0..old_h {
-            let old_row = (y * old_w) as usize;
-            let new_row = (y * target_w) as usize;
-
-            new_buf[new_row..new_row + old_w as usize]
-                .copy_from_slice(&self.main_buffer[old_row..old_row + old_w as usize]);
-        }
-
-        self.main_buffer = new_buf;
-        self.screen_buffer = self.main_buffer.clone();
-        self.buffer_size = (target_w, target_h);
     }
 
     fn render_ui(&mut self) {
-        if self.buffer_size.0 <= 50 || self.buffer_size.1 <= 50 {
-            return;
-        }
-
         for x in 0..=35 {
             for y in 0..=22 {
-                self.screen_buffer
-                    [((self.buffer_size.1 - 20 - y) * self.buffer_size.0 + 20 + x) as usize] =
-                    self.color;
+                let idx = ((self.buffer_size.1 - 20 - y) * self.buffer_size.0 + 20 + x) as usize;
+                let Some(buffer) = self.screen_buffer.get_mut(idx) else {
+                    continue;
+                };
+
+                *buffer = self.color;
             }
         }
     }
