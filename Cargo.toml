@@ -1,0 +1,11 @@
+[package]
+name = "paint-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+memfd = "0.6.5"
+memmap2 = "0.9.11"
+smallvec = "1.15.2"
+wayland-client = "0.31.14"
+wayland-protocols = { version = "0.32.13", features = ["client"] }
