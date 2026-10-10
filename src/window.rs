@@ -37,9 +37,7 @@ impl WindowState {
     pub fn new(width: u32, height: u32) -> Self {
         let conn = Connection::connect_to_env().unwrap();
         let ev: EventQueue<WindowState> = conn.new_event_queue();
-        let qhandle = ev.handle();
-        let display = conn.display();
-        display.get_registry(&qhandle, ());
+        conn.display().get_registry(&ev.handle(), ());
 
         let state = WindowState {
             want_close: false,
@@ -71,17 +69,21 @@ impl WindowState {
         self.ev = Some(ev);
     }
 
-    fn init_xdg_surface(&mut self, qh: &QueueHandle<WindowState>) {
-        let wm_base = self.wm_base.as_ref().unwrap();
-        let base_surface = self.base_surface.as_ref().unwrap();
+    fn try_init_xdg_surface(&mut self, qh: &QueueHandle<WindowState>) {
+        if let (Some(wm_base), Some(base_surface), true) = (
+            self.wm_base.as_ref(),
+            self.base_surface.as_ref(),
+            self.xdg_surface.is_none(),
+        ) {
+            let xdg_surface = wm_base.get_xdg_surface(base_surface, qh, ());
+            let toplevel = xdg_surface.get_toplevel(qh, ());
 
-        let xdg_surface = wm_base.get_xdg_surface(base_surface, qh, ());
-        let toplevel = xdg_surface.get_toplevel(qh, ());
-        toplevel.set_title("A fantastic window!".into());
+            toplevel.set_title("paint-rs".into());
 
-        base_surface.commit();
+            base_surface.commit();
 
-        self.xdg_surface = Some((xdg_surface, toplevel));
+            self.xdg_surface = Some((xdg_surface, toplevel))
+        }
     }
 
     fn show_surface(&mut self) {
@@ -190,11 +192,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WindowState {
                     let compositor =
                         registry.bind::<wl_compositor::WlCompositor, _, _>(name, 1, qh, ());
                     let surface = compositor.create_surface(qh, ());
-                    state.base_surface = Some(surface);
 
-                    if state.wm_base.is_some() && state.xdg_surface.is_none() {
-                        state.init_xdg_surface(qh);
-                    }
+                    state.base_surface = Some(surface);
+                    state.try_init_xdg_surface(qh);
                 }
 
                 "wl_shm" => {
@@ -209,11 +209,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WindowState {
 
                 "xdg_wm_base" => {
                     let wm_base = registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 1, qh, ());
-                    state.wm_base = Some(wm_base);
 
-                    if state.base_surface.is_some() && state.xdg_surface.is_none() {
-                        state.init_xdg_surface(qh);
-                    }
+                    state.wm_base = Some(wm_base);
+                    state.try_init_xdg_surface(qh);
                 }
                 _ => {}
             }
